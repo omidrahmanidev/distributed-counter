@@ -1,0 +1,23 @@
+spring:
+  application:
+    name: view-service
+  main:
+    banner-mode: off
+management:
+  endpoints.web.exposure.include: health,info,prometheus
+  endpoint.health.probes.enabled: true
+logging:
+  structured.format.console: logstash
+server:
+  port: 8080
+counter:
+  hmac-secret: ${HMAC_SECRET}
+  shard-count: ${COUNTER_SHARD_COUNT:128}
+spring.r2dbc:
+  url: ${R2DBC_URL:r2dbc:postgresql://localhost:5432/video}
+  username: ${POSTGRES_USER:video}
+  password: ${POSTGRES_PASSWORD:video}
+spring.data.redis.host: ${REDIS_HOST:localhost}
+spring.kafka.bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+spring.data.redis.timeout: 2s
+spring.data.redis.connect-timeout: 1s

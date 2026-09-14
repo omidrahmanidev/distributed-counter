@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: video-counter
+  namespace: video-counter
+data:
+  KAFKA_BOOTSTRAP_SERVERS: kafka.example.internal:9092
+  JDBC_URL: jdbc:postgresql://postgres.example.internal:5432/video
+  R2DBC_URL: r2dbc:postgresql://postgres.example.internal:5432/video
+  POSTGRES_USER: video
+  REDIS_HOST: redis.example.internal
+  COUNTER_SHARD_COUNT: "128"
+  STREAMS_APPLICATION_ID: video-counter-v1
+  STANDBY_REPLICAS: "1"
+  KAFKA_REPLICATION_FACTOR: "3"
+  VIEW_SERVICE_URL: http://view-service:8080
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: video-counter
+  namespace: video-counter
+type: Opaque
+stringData:
+  HMAC_SECRET: REPLACE_WITH_AT_LEAST_32_RANDOM_CHARACTERS
+  POSTGRES_PASSWORD: REPLACE_WITH_DATABASE_PASSWORD

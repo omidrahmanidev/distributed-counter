@@ -1,0 +1,20 @@
+spring:
+  application:
+    name: counter-stream-service
+  main:
+    banner-mode: off
+management:
+  endpoints.web.exposure.include: health,info,prometheus
+  endpoint.health.probes.enabled: true
+logging:
+  structured.format.console: logstash
+server:
+  port: 8080
+spring.kafka.bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+management.endpoint.health.group.readiness.include: readinessState,streams
+counter:
+  application-id: ${STREAMS_APPLICATION_ID:video-counter-v1}
+  shard-count: ${COUNTER_SHARD_COUNT:128}
+  standby-replicas: ${STANDBY_REPLICAS:0}
+  replication-factor: ${KAFKA_REPLICATION_FACTOR:1}
+management.endpoint.health.group.liveness.include: livenessState,streamsLiveness

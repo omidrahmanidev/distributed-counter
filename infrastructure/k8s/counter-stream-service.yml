@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: counter-stream-service
+  namespace: video-counter
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: counter-stream-service}
+  template:
+    metadata:
+      labels: {app: counter-stream-service}
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, fsGroup: 10001}
+      containers:
+        - name: counter-stream-service
+          image: video-counter/counter-stream-service:local
+          ports: [{containerPort: 8080, name: http}]
+          envFrom:
+            - configMapRef: {name: video-counter}
+            - secretRef: {name: video-counter}
+          resources:
+            requests: {cpu: "500m", memory: "512Mi"}
+            limits: {cpu: "2", memory: "2Gi"}
+          startupProbe:
+            httpGet: {path: /actuator/health/liveness, port: http}
+            failureThreshold: 60
+            periodSeconds: 5
+          readinessProbe:
+            httpGet: {path: /actuator/health/readiness, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /actuator/health/liveness, port: http}
+            periodSeconds: 10
+          volumeMounts:
+            - {name: state, mountPath: /tmp/video-counter-state}
+      volumes:
+        - name: state
+          emptyDir: {sizeLimit: 20Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: counter-stream-service
+  namespace: video-counter
+spec:
+  selector: {app: counter-stream-service}
+  ports: [{port: 8080, targetPort: http, name: http}]

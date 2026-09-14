@@ -1,0 +1,14 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: protect-trusted-view-identity
+  namespace: video-counter
+spec:
+  podSelector:
+    matchLabels: {app: view-service}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: api-gateway}
+      ports: [{protocol: TCP, port: 8080}]

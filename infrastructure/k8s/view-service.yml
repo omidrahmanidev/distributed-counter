@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: view-service
+  namespace: video-counter
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: view-service}
+  template:
+    metadata:
+      labels: {app: view-service}
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, fsGroup: 10001}
+      containers:
+        - name: view-service
+          image: video-counter/view-service:local
+          ports: [{containerPort: 8080, name: http}]
+          envFrom:
+            - configMapRef: {name: video-counter}
+            - secretRef: {name: video-counter}
+          resources:
+            requests: {cpu: "500m", memory: "512Mi"}
+            limits: {cpu: "2", memory: "2Gi"}
+          startupProbe:
+            httpGet: {path: /actuator/health/liveness, port: http}
+            failureThreshold: 60
+            periodSeconds: 5
+          readinessProbe:
+            httpGet: {path: /actuator/health/readiness, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /actuator/health/liveness, port: http}
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: view-service
+  namespace: video-counter
+spec:
+  selector: {app: view-service}
+  ports: [{port: 8080, targetPort: http, name: http}]
