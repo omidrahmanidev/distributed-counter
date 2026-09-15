@@ -49,6 +49,16 @@ changelog, not the one sitting in a Pod's heap.
 
 ### 2.1 Normal path (accepting one view)
 
+A request first reaches the API Gateway, which handles the initial routing and forwards the request to the appropriate backend service.
+
+The request then goes to the view-service. This service is built with Spring WebFlux and handles the incoming view request. Instead of updating a database directly, it creates a view event and publishes it to Kafka.
+
+The counter-stream-service consumes those events from Kafka. It uses Kafka Streams to remove duplicate events, count views across multiple shards, and aggregate them into the total view count for each video. The aggregated result is then published to another Kafka topic.
+
+The counter-sink-service listens to that final topic. It receives the latest video totals and stores them in both PostgreSQL and Redis.
+
+PostgreSQL keeps the durable version of the counter, while Redis is used for fast reads when clients request the current number of views.
+
 1. **Deterministic event identity.** `view-service` computes an HMAC-SHA256 `eventId` from a
    namespaced input containing the email, video ID, and `Idempotency-Key`. The same retry, from
    the same user, for the same video, with the same `Idempotency-Key`, always produces the exact
