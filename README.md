@@ -47,7 +47,21 @@ the database, and PostgreSQL/Redis are read models rebuilt from periodic, idempo
 correctness; the count that survives a crash is always the one written to RocksDB's Kafka
 changelog, not the one sitting in a Pod's heap.
 
-### 2.1 Normal path (accepting one view)
+### 2.1 High-Level Flow
+
+A request first reaches the **API Gateway**, which routes it to the appropriate backend service.
+
+For a new view, the request is forwarded to the **view-service**. This service is built with Spring WebFlux and publishes a view event to Kafka instead of writing directly to a database.
+
+The **counter-stream-service** consumes those events using Kafka Streams. It removes duplicate events, counts views across multiple shards, and aggregates them into the total view count for each video.
+
+Instead of writing every single view directly to PostgreSQL or Redis, the stream service keeps the counters in its local state and periodically emits aggregated snapshots. This reduces a very large number of raw view events into a much smaller number of persistence updates.
+
+The **counter-sink-service** consumes those aggregated totals and stores the latest value in both PostgreSQL and Redis.
+
+PostgreSQL is used for durable storage, while Redis is used for fast reads when clients request the current number of views.
+
+### 2.2 Normal path (accepting one view)
 
 A request first reaches the API Gateway, which handles the initial routing and forwards the request to the appropriate backend service.
 
@@ -88,7 +102,7 @@ PostgreSQL keeps the durable version of the counter, while Redis is used for fas
    also checks the version. Neither store ever adds a delta — they always write the latest
    known absolute total, and only if it is actually newer.
 
-### 2.2 Periodic snapshotting (the real safety net)
+### 2.3 Periodic snapshotting (the real safety net)
 
 The one-second punctuation in step 5 above is not just an optimization — it is the mechanism
 that actually gets counts out of memory and into something durable and shareable. Each
@@ -99,7 +113,7 @@ Streams transaction (`exactly_once_v2`), so a crash mid-punctuation cannot silen
 duplicate a shard's contribution — recovery replays from the changelog and produces the same
 result.
 
-### 2.3 Surviving a Pod crash
+### 2.4 Surviving a Pod crash
 
 No Streams task keeps its state only in memory. Every count lives in a local RocksDB store that
 is continuously mirrored to a Kafka changelog topic. So if a Streams Pod crashes:
@@ -113,7 +127,7 @@ is continuously mirrored to a Kafka changelog topic. So if a Streams Pod crashes
 A count is never lost or double-applied "because a Pod happened to die," because its fate is
 always written to a changelog, not held only in one process's memory.
 
-### 2.4 What happens if Redis goes down
+### 2.5 What happens if Redis goes down
 
 This is the most important failure case for the **read path**, so it gets its own section.
 
@@ -146,13 +160,13 @@ changes on the fallback path. The same reasoning covers PostgreSQL being unavail
 keeps flowing through Kafka regardless, cached reads keep working, and the JDBC sink retries with
 exponential backoff (500 ms up to 30 s) without advancing past the failed work.
 
-### 2.5 Handling duplicate events
+### 2.6 Handling duplicate events
 
 Duplicates can happen for three different reasons, and this design handles all three:
 
 - **A user retries the same click.** Caught at the source — the client-supplied
   `Idempotency-Key` makes the `eventId` identical, so Kafka Streams' `WindowStore` recognizes it
-  as already-seen and drops it (see [2.1](#21-normal-path-accepting-one-view), step 4).
+  as already-seen and drops it (see [2.2](#22-normal-path-accepting-one-view), step 4).
 - **Kafka redelivers a shard or total snapshot.** Kafka Streams uses `exactly_once_v2` to
   transactionally coordinate consumed offsets, state-store updates, and records produced inside
   the Streams topology. External systems such as PostgreSQL and Redis are outside that Kafka
@@ -167,7 +181,7 @@ This makes processing an event, a shard snapshot, or a total snapshot twice have
 effect* as processing it once — the property called **idempotency**. It holds at every hop of
 the pipeline, not just at the very first one.
 
-### 2.6 Clean architecture layering
+### 2.7 Clean architecture layering
 
 The project follows a Ports & Adapters-inspired structure, keeping domain logic and application
 policies separated from external infrastructure where practical:
@@ -185,7 +199,7 @@ The benefit: storage and cache details are behind narrow ports where that bounda
 while Kafka Streams processors remain Kafka-specific adapters because they directly extend Streams
 framework classes.
 
-### 2.7 Architecture Patterns & Design Decisions
+### 2.8 Architecture Patterns & Design Decisions
 
 The steps above are built out of well-known patterns. Naming them here is meant to make the
 design easier to recognize and discuss, not to check a buzzword box — each one is doing real
@@ -197,17 +211,17 @@ work at a specific stage.
 | **Event-Driven Architecture / Event Streaming** | Every stage talks to the next only through a Kafka topic (`video-view-events` → `counter-shard-snapshots` → `video-total-snapshots`). | Decouples ingestion, counting, and materialization so each can fail, restart, or scale independently. |
 | **Eventual Consistency** | `POST /views` can return `202 Accepted` before the updated total is visible through `GET`. | The system intentionally favors burst absorption and scalable writes over immediate global read-after-write consistency. |
 | **Exactly-Once Stream Processing** | Kafka Streams is configured with `exactly_once_v2` for the topology's consumed offsets, state stores, and produced records. | Prevents committed stream processing work from being partially applied inside Kafka Streams, without claiming a global transaction with PostgreSQL or Redis. |
-| **Idempotent Consumer / Idempotent Receiver** | Dedup `WindowStore` keyed by `eventId` (2.1, step 4); version-gated `UPSERT` in PostgreSQL and version-gated Lua script in Redis (2.5). | Makes redelivery — from a client retry, stream replay, or sink redelivery — a safe no-op instead of a double-count. |
-| **Sharding** (hash-based key partitioning) | `counterShardId = stableHash(eventId) % 128`, folded into the Kafka key `videoId:shard` (2.1, step 2). | Spreads one viral video's traffic across many partitions instead of pinning it to one. |
+| **Idempotent Consumer / Idempotent Receiver** | Dedup `WindowStore` keyed by `eventId` (2.2, step 4); version-gated `UPSERT` in PostgreSQL and version-gated Lua script in Redis (2.6). | Makes redelivery — from a client retry, stream replay, or sink redelivery — a safe no-op instead of a double-count. |
+| **Sharding** (hash-based key partitioning) | `counterShardId = stableHash(eventId) % 128`, folded into the Kafka key `videoId:shard` (2.2, step 2). | Spreads one viral video's traffic across many partitions instead of pinning it to one. |
 | **Materialized View** | The `video_counter` table and the `video:{id}:views` Redis hash. | Both are read-optimized projections rebuilt from the stream of snapshots — neither one is the source of truth by itself. |
-| **Cache-Aside** (a.k.a. Lazy Loading) | `GET` reads Redis first, falls back to R2DBC PostgreSQL on a miss, and opportunistically fills Redis afterward (2.4). | The classic read-through-cache-with-fallback shape, with an explicit, version-safe fill step. |
-| **Snapshot pattern** (periodic, not per-event) | The one-second punctuation that emits only *dirty* shard/video state (2.2), instead of a message per view. | Trades a small, bounded latency window for a large reduction in write volume downstream. |
+| **Cache-Aside** (a.k.a. Lazy Loading) | `GET` reads Redis first, falls back to R2DBC PostgreSQL on a miss, and opportunistically fills Redis afterward (2.5). | The classic read-through-cache-with-fallback shape, with an explicit, version-safe fill step. |
+| **Snapshot pattern** (periodic, not per-event) | The one-second punctuation that emits only *dirty* shard/video state (2.3), instead of a message per view. | Trades a small, bounded latency window for a large reduction in write volume downstream. |
 | **Version-Based Optimistic Concurrency / Monotonic Versioning** | PostgreSQL and Redis accept only snapshots with a strictly newer version. | Protects the read models from duplicate, late, or out-of-order snapshots. |
 | **Graceful Degradation / Fallback** | Redis miss or Redis failure falls back to PostgreSQL; cache repair failure does not fail an otherwise successful database read. | Keeps reads available when the cache is cold or temporarily unavailable. |
 | **Retry with Exponential Backoff** | The sink's Kafka error handler retries store failures from 500 ms up to 30 s and does not advance past the failed record. | Gives PostgreSQL/Redis failures time to recover without skipping failed materialization work. |
 | **Dead Letter Topic** | Kafka Streams sends invalid view/shard payloads to `<topic>.DLT`; the sink error handler sends configured non-retryable listener failures to the source topic's DLT. | Keeps malformed records visible for inspection instead of silently dropping them. |
 | **Durable Stateful Stream Processing** | Local RocksDB state stores are backed by Kafka changelog topics and restored after task/Pod failure. | Lets counters survive process loss without relying on heap state. |
-| **Ports & Adapters-inspired layering** | Domain/application code is separated from web, Kafka, PostgreSQL, and Redis adapters where practical (2.6). | Keeps policy code testable while avoiding unnecessary framework-independent rewrites of Kafka Streams processors. |
+| **Ports & Adapters-inspired layering** | Domain/application code is separated from web, Kafka, PostgreSQL, and Redis adapters where practical (2.7). | Keeps policy code testable while avoiding unnecessary framework-independent rewrites of Kafka Streams processors. |
 | **Backpressure / Bulkhead** (bounded admission) | A bounded number of in-flight Kafka publishes (default 4096) admitted per `view-service` instance; excess requests get `503` instead of queuing unboundedly. | Protects the ingestion service itself from unbounded concurrent work under the 1,000,000-request spike. |
 | **Kappa Architecture** | The counting pipeline as a whole: dedup → shard count → aggregate → materialize, entirely through Kafka Streams. | There is no separate nightly batch-recomputation layer; the stream itself is the only source of derived state. |
 
