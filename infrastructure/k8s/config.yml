@@ -10,6 +10,7 @@ data:
   POSTGRES_USER: video
   REDIS_HOST: redis.example.internal
   COUNTER_SHARD_COUNT: "128"
+  COUNTER_REDIS_KEY_PREFIX: "video:"
   STREAMS_APPLICATION_ID: video-counter-v1
   STANDBY_REPLICAS: "1"
   KAFKA_REPLICATION_FACTOR: "3"

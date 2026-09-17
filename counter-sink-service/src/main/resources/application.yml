@@ -36,3 +36,13 @@ spring.kafka:
   listener:
     ack-mode: record
     concurrency: 2
+counter.projection:
+  topic: ${COUNTER_CDC_TOPIC:counter-cdc.public.video_counter}
+  consumer-group: ${COUNTER_CDC_CONSUMER_GROUP:counter-cache-projector-v1}
+  key-prefix: ${COUNTER_REDIS_KEY_PREFIX:video:}
+  marker-key: ${COUNTER_REDIS_MARKER_KEY:counter-projection:generation}
+  signaling-table: ${COUNTER_CDC_SIGNALING_TABLE:public.debezium_signal}
+  counter-table: ${COUNTER_CDC_COUNTER_TABLE:public.video_counter}
+  rebuild-enabled: ${COUNTER_CDC_REBUILD_ENABLED:true}
+  recovery-interval-ms: ${COUNTER_CDC_RECOVERY_INTERVAL_MS:5000}
+  retry-interval-ms: ${COUNTER_CDC_RETRY_INTERVAL_MS:2000}

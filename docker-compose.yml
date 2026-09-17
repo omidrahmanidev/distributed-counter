@@ -15,6 +15,7 @@ x-environment: &environment
   R2DBC_URL: r2dbc:postgresql://postgres:5432/video
   REDIS_HOST: redis
   COUNTER_SHARD_COUNT: ${COUNTER_SHARD_COUNT:-128}
+  COUNTER_REDIS_KEY_PREFIX: ${COUNTER_REDIS_KEY_PREFIX:-video:}
 services:
   kafka:
     image: apache/kafka:3.9.1
@@ -49,7 +50,8 @@ services:
       KAFKA_REPLICATION_FACTOR: 1
     volumes: ["./infrastructure/kafka:/scripts:ro"]
   postgres:
-    image: postgres:17-alpine
+    image: postgres:17.6-alpine
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=10", "-c", "max_wal_senders=10"]
     environment:
       POSTGRES_DB: video
       POSTGRES_USER: video
@@ -61,8 +63,8 @@ services:
       timeout: 5s
       retries: 10
   redis:
-    image: redis:7.4-alpine
-    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    image: redis:7.4.5-alpine
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -77,6 +79,41 @@ services:
       topics: {condition: service_completed_successfully}
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
+  kafka-connect:
+    image: quay.io/debezium/connect:3.0.8.Final
+    restart: unless-stopped
+    ports: ["127.0.0.1:8083:8083"]
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: counter-connect
+      CONFIG_STORAGE_TOPIC: counter-connect-configs
+      OFFSET_STORAGE_TOPIC: counter-connect-offsets
+      STATUS_STORAGE_TOPIC: counter-connect-status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_FLUSH_INTERVAL_MS: 1000
+      CONFIG_PROVIDERS: env
+      CONFIG_PROVIDERS_ENV_CLASS: org.apache.kafka.common.config.provider.EnvVarConfigProvider
+      POSTGRES_USER: video
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-video-local-password}
+    depends_on:
+      counter-sink-service: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8083/connectors"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  register-counter-connector:
+    image: python:3.13.7-alpine
+    entrypoint: ["python", "/scripts/register-connector.py"]
+    environment:
+      CONNECT_URL: http://kafka-connect:8083
+    volumes:
+      - ./infrastructure/debezium:/scripts:ro
+      - ./counter-sink-service/src/main/resources/debezium/counter-connector.json:/config/counter-connector.json:ro
+    depends_on:
+      kafka-connect: {condition: service_healthy}
   counter-stream-service:
     <<: *app
     image: video-counter/counter-stream-service:local

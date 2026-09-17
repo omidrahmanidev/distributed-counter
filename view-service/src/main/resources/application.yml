@@ -13,6 +13,8 @@ server:
 counter:
   hmac-secret: ${HMAC_SECRET}
   shard-count: ${COUNTER_SHARD_COUNT:128}
+  projection:
+    key-prefix: ${COUNTER_REDIS_KEY_PREFIX:video:}
 spring.r2dbc:
   url: ${R2DBC_URL:r2dbc:postgresql://localhost:5432/video}
   username: ${POSTGRES_USER:video}

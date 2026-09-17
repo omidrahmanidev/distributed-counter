@@ -42,8 +42,8 @@ Design a **Distributed Counter** that can handle this scale while considering th
 ![distributed-counter](xassets/design.png)
 
 The main idea is simple: **Kafka absorbs the burst, Kafka Streams keeps a durable count outside
-the database, and PostgreSQL/Redis are read models rebuilt from periodic, idempotent snapshots
-— never written to per view.** The system never trusts an in-memory counter alone for
+the database, PostgreSQL stores the authoritative persisted snapshots, and Redis is a derived
+read model maintained from PostgreSQL changes through Debezium and Kafka.** The system never trusts an in-memory counter alone for
 correctness; the count that survives a crash is always the one written to RocksDB's Kafka
 changelog, not the one sitting in a Pod's heap.
 
@@ -57,9 +57,9 @@ The **counter-stream-service** consumes those events using Kafka Streams. It rem
 
 Instead of writing every single view directly to PostgreSQL or Redis, the stream service keeps the counters in its local state and periodically emits aggregated snapshots. This reduces a very large number of raw view events into a much smaller number of persistence updates.
 
-The **counter-sink-service** consumes those aggregated totals and stores the latest value in both PostgreSQL and Redis.
-
-PostgreSQL is used for durable storage, while Redis is used for fast reads when clients request the current number of views.
+The **counter-sink-service** consumes those aggregated totals and stores the latest value only in
+PostgreSQL. PostgreSQL logical replication and Debezium publish changes to the counter CDC topic;
+the Redis projector consumes that topic and updates Redis for fast reads.
 
 ### 2.2 Normal path (accepting one view)
 
@@ -69,9 +69,9 @@ The request then goes to the view-service. This service is built with Spring Web
 
 The counter-stream-service consumes those events from Kafka. It uses Kafka Streams to remove duplicate events, count views across multiple shards, and aggregate them into the total view count for each video. The aggregated result is then published to another Kafka topic.
 
-The counter-sink-service listens to that final topic. It receives the latest video totals and stores them in both PostgreSQL and Redis.
-
-PostgreSQL keeps the durable version of the counter, while Redis is used for fast reads when clients request the current number of views.
+The counter-sink-service listens to that final topic and stores the latest video totals in
+PostgreSQL. Debezium captures committed `video_counter` changes from the PostgreSQL WAL, Kafka
+Connect publishes them to Kafka, and the CDC projector creates the Redis read model.
 
 1. **Deterministic event identity.** `view-service` computes an HMAC-SHA256 `eventId` from a
    namespaced input containing the email, video ID, and `Idempotency-Key`. The same retry, from
@@ -97,10 +97,9 @@ PostgreSQL keeps the durable version of the counter, while Redis is used for fas
 6. **Stage 2: aggregate shards into a video total.** A second Streams processor keeps the last
    accepted version per shard and a running total. It applies each shard's *delta*
    (`newCount - previousCount`), so replaying an already-applied snapshot changes nothing.
-7. **Idempotent materialization.** A JDBC sink reads dirty video totals and performs a
-   version-gated `UPSERT` into PostgreSQL, then atomically updates Redis with a Lua script that
-   also checks the version. Neither store ever adds a delta — they always write the latest
-   known absolute total, and only if it is actually newer.
+7. **Idempotent materialization.** A JDBC sink performs a version-gated `UPSERT` into PostgreSQL.
+   Debezium then emits the committed row through Kafka, and the Redis projector atomically applies
+   it with a Lua version check. Neither store adds a delta; both accept only newer absolute totals.
 
 ### 2.3 Periodic snapshotting (the real safety net)
 
@@ -143,22 +142,26 @@ flowchart LR
 and has the key?}
 Q -- yes --> H[Return cached count]
 Q -- no / miss --> D[R2DBC read from PostgreSQL]
-D --> F[Opportunistically fill Redis
-via version-guarded Lua script]
-F --> H2[Return count from PostgreSQL]
+D --> H2[Return count from PostgreSQL]
 ```
 
 1. A `GET` always tries reactive Redis first.
 2. On a cache miss or Redis error, it falls back to R2DBC PostgreSQL — the authoritative row.
-3. After a successful database read, the result opportunistically fills Redis back in, using the
-   same version-guarded Lua script the sink uses. If that fill fails, the already-successful
-   database read is still returned to the caller; a failed cache fill never fails the request.
+3. The read request does not fill Redis. Redis remains exclusively owned by the CDC projector, so
+   recovery and repopulation happen asynchronously through the PostgreSQL → Debezium → Kafka →
+   projector path.
 
-PostgreSQL is always allowed to answer, and the version check means a slow or resurrected Redis
-instance can never overwrite a newer value with an older one during cache repair. Only latency
-changes on the fallback path. The same reasoning covers PostgreSQL being unavailable: ingestion
-keeps flowing through Kafka regardless, cached reads keep working, and the JDBC sink retries with
-exponential backoff (500 ms up to 30 s) without advancing past the failed work.
+After complete Redis loss, the projector detects that its Redis generation marker is gone and
+inserts an idempotent `execute-snapshot` request into the Debezium signaling table. Debezium runs
+an incremental snapshot of `video_counter`, causing unchanged rows to traverse the normal CDC
+pipeline again. No component bulk-copies PostgreSQL rows directly into Redis. Snapshot records can
+overlap newer streaming records; the atomic Lua script applies a record only when its version is
+strictly greater than the stored version, so equal duplicates and stale snapshot rows are harmless.
+
+PostgreSQL is always allowed to answer. If PostgreSQL is unavailable, ingestion keeps flowing
+through Kafka, cached reads keep working, and the JDBC sink retries without advancing past failed
+work. If Redis is temporarily unavailable, the CDC listener retries the same record indefinitely
+with a fixed backoff, preserving its Kafka offset until projection succeeds.
 
 ### 2.6 Handling duplicate events
 
@@ -172,8 +175,8 @@ Duplicates can happen for three different reasons, and this design handles all t
   the Streams topology. External systems such as PostgreSQL and Redis are outside that Kafka
   transaction, so the sink is still designed to tolerate redelivery through version-gated
   idempotent writes. Stage 2 ignores any shard snapshot whose `version` is not strictly greater
-  than the last one it recorded; the sink's `UPSERT` and Lua script both ignore any total snapshot
-  whose `version` is not strictly greater than what is already stored.
+  than the last one it recorded; PostgreSQL's version-gated `UPSERT` and the CDC projector's
+  version-gated Redis Lua script both reject stale total snapshots.
 - **A crash forces reprocessing.** `exactly_once_v2` inside Kafka Streams means a replayed input
   after a crash reproduces the exact same output — not a second copy of it.
 
@@ -213,12 +216,13 @@ work at a specific stage.
 | **Exactly-Once Stream Processing** | Kafka Streams is configured with `exactly_once_v2` for the topology's consumed offsets, state stores, and produced records. | Prevents committed stream processing work from being partially applied inside Kafka Streams, without claiming a global transaction with PostgreSQL or Redis. |
 | **Idempotent Consumer / Idempotent Receiver** | Dedup `WindowStore` keyed by `eventId` (2.2, step 4); version-gated `UPSERT` in PostgreSQL and version-gated Lua script in Redis (2.6). | Makes redelivery — from a client retry, stream replay, or sink redelivery — a safe no-op instead of a double-count. |
 | **Sharding** (hash-based key partitioning) | `counterShardId = stableHash(eventId) % 128`, folded into the Kafka key `videoId:shard` (2.2, step 2). | Spreads one viral video's traffic across many partitions instead of pinning it to one. |
-| **Materialized View** | The `video_counter` table and the `video:{id}:views` Redis hash. | Both are read-optimized projections rebuilt from the stream of snapshots — neither one is the source of truth by itself. |
-| **Cache-Aside** (a.k.a. Lazy Loading) | `GET` reads Redis first, falls back to R2DBC PostgreSQL on a miss, and opportunistically fills Redis afterward (2.5). | The classic read-through-cache-with-fallback shape, with an explicit, version-safe fill step. |
+| **Materialized View** | The `video:{id}:views` Redis hash. | It is rebuilt from PostgreSQL CDC; PostgreSQL is the source of truth for persisted counter snapshots. |
+| **Read fallback** | `GET` reads Redis first and falls back to R2DBC PostgreSQL on a miss or outage. | Reads remain available without allowing the request path to write the CDC-owned Redis projection. |
 | **Snapshot pattern** (periodic, not per-event) | The one-second punctuation that emits only *dirty* shard/video state (2.3), instead of a message per view. | Trades a small, bounded latency window for a large reduction in write volume downstream. |
 | **Version-Based Optimistic Concurrency / Monotonic Versioning** | PostgreSQL and Redis accept only snapshots with a strictly newer version. | Protects the read models from duplicate, late, or out-of-order snapshots. |
-| **Graceful Degradation / Fallback** | Redis miss or Redis failure falls back to PostgreSQL; cache repair failure does not fail an otherwise successful database read. | Keeps reads available when the cache is cold or temporarily unavailable. |
-| **Retry with Exponential Backoff** | The sink's Kafka error handler retries store failures from 500 ms up to 30 s and does not advance past the failed record. | Gives PostgreSQL/Redis failures time to recover without skipping failed materialization work. |
+| **Graceful Degradation / Fallback** | Redis miss or Redis failure falls back to PostgreSQL; the request path returns the PostgreSQL value without writing Redis. | Keeps reads available when the cache is cold or temporarily unavailable while Redis remains owned by the CDC projector. |
+| **Write persistence retry** | The sink's Kafka error handler retries PostgreSQL persistence failures with exponential backoff starting at 500 ms and capped at 30 s, without advancing past the failed record. | Gives PostgreSQL time to recover without skipping failed persistence work. |
+| **CDC projection retry** | The CDC listener retries Redis projection failures indefinitely with a fixed 2 s backoff, preserving its Kafka offset until projection succeeds. | Gives Redis time to recover without losing the CDC record that updates the read model. |
 | **Dead Letter Topic** | Kafka Streams sends invalid view/shard payloads to `<topic>.DLT`; the sink error handler sends configured non-retryable listener failures to the source topic's DLT. | Keeps malformed records visible for inspection instead of silently dropping them. |
 | **Durable Stateful Stream Processing** | Local RocksDB state stores are backed by Kafka changelog topics and restored after task/Pod failure. | Lets counters survive process loss without relying on heap state. |
 | **Ports & Adapters-inspired layering** | Domain/application code is separated from web, Kafka, PostgreSQL, and Redis adapters where practical (2.7). | Keeps policy code testable while avoiding unnecessary framework-independent rewrites of Kafka Streams processors. |
@@ -345,9 +349,10 @@ a client claims about when a view "really" happened.
 ### 4.7 What we deliberately did *not* add (yet)
 
 - **A circuit breaker in front of Redis/PostgreSQL calls.** Right now, "store unavailable" is
-  handled with reactive fallback (Redis → PostgreSQL) and exponential backoff (sink retries),
-  which works, but every request still pays the cost of attempting a dead store first. A
-  breaker would trip after a few failures and skip the attempt for a while, saving latency.
+  handled with reactive fallback (Redis → PostgreSQL), write persistence retry with exponential
+  backoff, and CDC projection retry with fixed unlimited backoff. That works, but every request
+  still pays the cost of attempting a dead store first. A breaker would trip after a few failures
+  and skip the attempt for a while, saving latency.
 - **A pre-filter (e.g. a Bloom filter) in front of the dedup `WindowStore`.** Every accepted
   event currently does one windowed lookup before being counted. At very high unique-event
   volume this is fine, but an approximate pre-filter could reject most non-duplicates without
@@ -394,6 +399,24 @@ curl http://localhost:8080/api/videos/123/views
 Repeating the `POST` with the same `Idempotency-Key` leaves the total unchanged; use a different
 key to record another legitimate view. Poll the `GET` after a few seconds — the count is
 eventually consistent, not instant.
+
+The Compose environment starts PostgreSQL with logical replication enabled, Kafka, Redis, Kafka
+Connect with Debezium, and registers the connector automatically. The registration job waits for
+both the connector and its task to reach `RUNNING`.
+
+Run unit tests and the full integration suite (including the real PostgreSQL/Kafka/Redis/Connect
+containers) with:
+
+```bash
+./mvnw test
+./mvnw verify
+```
+
+For IntelliJ debugging, run
+`ro.midra.sink.TestDistributedCounterApplication` from the counter-sink-service test sources.
+That launcher starts all four Testcontainers, migrates the database, registers Debezium, waits for
+it to run, and then starts the normal application so breakpoints in production code work. Docker
+is the only locally installed infrastructure it uses; all ports are dynamically mapped.
 
 Optional load experiment with k6:
 

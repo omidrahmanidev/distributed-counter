@@ -18,9 +18,8 @@ public class GetViewCount {
     /**
      * Reads the view total using Redis as a cache and PostgreSQL as the durable read model.
      *
-     * <p>Redis misses and Redis failures both fall back to PostgreSQL. Once PostgreSQL answers, cache
-     * repair is best-effort and uses the cache adapter's version-aware write, so a repair failure
-     * does not turn a successful durable read into a failed request.
+     * <p>Redis misses and failures fall back to PostgreSQL without writing the cache. Only the CDC
+     * projector populates Redis.
      */
     public Mono<Long> get(long videoId) {
         validator.validateVideo(videoId);
@@ -45,23 +44,6 @@ public class GetViewCount {
     }
 
     private Mono<Long> readDurable(long videoId) {
-        return query
-                .find(videoId)
-                .flatMap(
-                        counter ->
-                                counter.map(value -> repairCache(videoId, value)).orElseGet(() -> Mono.just(0L)));
-    }
-
-    private Mono<Long> repairCache(long videoId, StoredCounter counter) {
-        return cache
-                .repair(videoId, counter)
-                .thenReturn(counter.count())
-                .onErrorResume(
-                        error -> {
-                            log.atDebug()
-                                    .addKeyValue("videoId", videoId)
-                                    .log("Cache fill unavailable; returning PostgreSQL result");
-                            return Mono.just(counter.count());
-                        });
+        return query.find(videoId).map(counter -> counter.map(StoredCounter::count).orElse(0L));
     }
 }
