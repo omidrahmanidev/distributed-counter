@@ -442,3 +442,12 @@ k6 run -e BASE_URL=http://localhost:8080 -e VUS=100 -e DURATION=60s -e VIDEO_ID=
   show, in real time, whether the system is keeping up with a traffic spike.
 - Run a distributed, verified-capacity load test to validate the "roughly a million views in a
   burst" scaling target with real numbers, not just local k6 runs.
+
+- **Hot-set Redis caching instead of a full projection.** The current CDC pipeline can materialize 
+   every video's counter into Redis, including cold videos that may rarely or never be read. At much
+   larger cardinalities, this can waste significant Redis memory. A future optimization would keep only 
+   the **hot working set** in Redis — for example, the most frequently accessed or top/trending videos 
+   within a recent time window — while PostgreSQL remains the durable source of truth. Redis Sorted Sets 
+   and windowed stream aggregation could be used to identify hot videos dynamically, allowing a previously cold 
+   video that suddenly becomes popular to enter the cache automatically. Cold entries could expire through TTL,
+   reducing Redis memory usage without affecting correctness.
